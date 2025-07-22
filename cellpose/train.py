@@ -7,34 +7,100 @@ from pathlib import Path
 import torch
 from torch import nn
 from tqdm import trange
+import tqdm 
 from numba import prange
 
 import logging
 
 train_logger = logging.getLogger(__name__)
 
+print("Using Custom Modified Cellpose")
 
-def _loss_fn_seg(lbl, y, device):
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=0.25, gamma=2.0, reduction='mean'):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        # inputs: raw logits
+        bce_loss = nn.functional.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
+        pt = torch.exp(-bce_loss)
+        focal_loss = self.alpha * (1 - pt) ** self.gamma * bce_loss
+
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
+
+def _loss_fn_seg(lbl, y, device, focal_weight=0.0, bce_weight=5.0, 
+                 focal_alpha=0.25, focal_gamma=2.0):
     """
-    Calculates the loss function between true labels lbl and prediction y.
+    Flow loss + Weighted Focal loss + Weighted BCE loss for Cellpose.
 
     Args:
-        lbl (numpy.ndarray): True labels (cellprob, flowsY, flowsX).
-        y (torch.Tensor): Predicted values (flowsY, flowsX, cellprob).
-        device (torch.device): Device on which the tensors are located.
+        lbl (numpy.ndarray): Ground truth array with shape [B, 3, H, W]
+                             where channels are [cellprob, flowY, flowX].
+        y (torch.Tensor): Predictions with shape [B, 3, H, W]
+                          where channels are [flowY, flowX, cellprob].
+        device (torch.device): Torch device.
+        focal_weight (float): Weight for focal loss term.
+        bce_weight (float): Weight for BCE loss term.
 
     Returns:
-        torch.Tensor: Loss value.
-
+        torch.Tensor: Total loss (flow + weighted focal + weighted BCE).
     """
-    criterion = nn.MSELoss(reduction="mean")
-    criterion2 = nn.BCEWithLogitsLoss(reduction="mean")
-    veci = 5. * torch.from_numpy(lbl[:, 1:]).to(device)
-    loss = criterion(y[:, :2], veci)
-    loss /= 2.
-    loss2 = criterion2(y[:, -1], torch.from_numpy(lbl[:, 0] > 0.5).to(device).float())
-    loss = loss + loss2
-    return loss
+    vec1 = torch.from_numpy(lbl).to(device).float()
+
+    # Targets
+    flow_targets = 5. * vec1[:, 1:]             # [flowY, flowX]
+    prob_targets = (vec1[:, 0] > 0.5).float()   # binary mask from cellprob
+
+    # Predictions
+    flows_pred = y[:, :2]                       # predicted [flowY, flowX]
+    probs_pred = y[:, 2]                        # predicted logits (not sigmoid)
+
+    # 1. Flow loss (scaled MSE)
+    mse_loss = nn.MSELoss()(flows_pred, flow_targets)
+    mse_loss /= 2.
+
+    # 2. Focal loss
+    focal_loss_fn = FocalLoss(alpha=focal_alpha, gamma=focal_gamma)
+    focal_loss = focal_loss_fn(probs_pred, prob_targets)
+
+    # 3. BCE loss
+    bce_loss = nn.functional.binary_cross_entropy_with_logits(probs_pred, prob_targets)
+
+    # 4. Weighted combination
+    hybrid_prob_loss = focal_weight * focal_loss + bce_weight * bce_loss
+
+    # Total loss
+    return mse_loss + hybrid_prob_loss
+
+# def _loss_fn_seg(lbl, y, device):
+#     """
+#     Calculates the loss function between true labels lbl and prediction y.
+
+#     Args:
+#         lbl (numpy.ndarray): True labels (cellprob, flowsY, flowsX).
+#         y (torch.Tensor): Predicted values (flowsY, flowsX, cellprob).
+#         device (torch.device): Device on which the tensors are located.
+
+#     Returns:
+#         torch.Tensor: Loss value.
+
+#     """
+#     criterion = nn.MSELoss(reduction="mean")
+#     criterion2 = nn.BCEWithLogitsLoss(reduction="mean")
+#     veci = 5. * torch.from_numpy(lbl[:, 1:]).to(device)
+#     loss = criterion(y[:, :2], veci)
+#     loss /= 2.
+#     loss2 = criterion2(y[:, -1], torch.from_numpy(lbl[:, 0] > 0.5).to(device).float())
+#     loss = loss + loss2
+#     return loss
 
 
 def _get_batch(inds, data=None, labels=None, files=None, labels_files=None,
@@ -334,7 +400,8 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
               channel_axis=None, rgb=False, normalize=True, compute_flows=False,
               save_path=None, save_every=100, save_each=False, nimg_per_epoch=None,
               nimg_test_per_epoch=None, rescale=True, scale_range=None, bsize=224,
-              min_train_masks=5, model_name=None):
+              min_train_masks=5, model_name=None, focal_weight=0.0, bce_weight=5.0,
+              focal_gamma=2.0, focal_alpha=0.25):
     """
     Train the network with images for segmentation.
 
@@ -456,7 +523,7 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
 
     lavg, nsum = 0, 0
     train_losses, test_losses = np.zeros(n_epochs), np.zeros(n_epochs)
-    for iepoch in range(n_epochs):
+    for iepoch in tqdm.tqdm(range(n_epochs), desc="Training Model (Epochs)"):
         np.random.seed(iepoch)
         if nimg != nimg_per_epoch:
             # choose random images for epoch with probability train_probs
@@ -484,7 +551,8 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
             # network and loss optimization
             X = torch.from_numpy(imgi).to(device)
             y = net(X)[0]
-            loss = _loss_fn_seg(lbl, y, device)
+            loss = _loss_fn_seg(lbl, y, device, focal_weight=focal_weight, bce_weight=bce_weight, 
+                                focal_gamma=focal_gamma, focal_alpha=focal_alpha)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -498,6 +566,7 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
             train_losses[iepoch] += train_loss
         train_losses[iepoch] /= nimg_per_epoch
 
+        # this is for the validation
         if iepoch == 5 or iepoch % 10 == 0:
             lavgt = 0.
             if test_data is not None or test_files is not None:
@@ -523,7 +592,8 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
                             xy=(bsize, bsize))[:2]
                         X = torch.from_numpy(imgi).to(device)
                         y = net(X)[0]
-                        loss = _loss_fn_seg(lbl, y, device)
+                        loss = _loss_fn_seg(lbl, y, device, focal_weight=focal_weight, bce_weight=bce_weight, 
+                                            focal_alpha=focal_alpha, focal_gamma=focal_gamma)
                         test_loss = loss.item()
                         test_loss *= len(imgi)
                         lavgt += test_loss
